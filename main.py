@@ -369,10 +369,7 @@ def telegram_handler():
                 if not text or not chat_id:
                     continue
                 
-                # Handle command dengan @botname (untuk grup)
                 command = text.split('@')[0].lower() if text.startswith('/') else ''
-                
-                print(f"📩 Received: {text} from {chat_id}")  # Debug log
                 
                 if command == '/start':
                     reply = "🤖 <b>Gate.io Maintenance Bot</b>\n\n"
@@ -400,9 +397,7 @@ def telegram_handler():
                     d = sum(1 for v in previous_deposit.values() if v)
                     caption = f"📊 Maintenance Report\n📅 {wib}\n📤 Withdraw: {w} | 📥 Deposit: {d}"
                     
-                    if send_telegram_file(chat_id, filepath, caption):
-                        print(f"\n📄 Export sent to {chat_id}")
-                    else:
+                    if not send_telegram_file(chat_id, filepath, caption):
                         send_telegram_to(chat_id, "❌ Gagal mengirim file")
                 
                 elif command == '/export_json':
@@ -413,9 +408,7 @@ def telegram_handler():
                         d = sum(1 for v in previous_deposit.values() if v)
                         caption = f"📊 State JSON\n📅 {wib}\n📤 Withdraw: {w} | 📥 Deposit: {d}"
                         
-                        if send_telegram_file(chat_id, STATE_FILE, caption):
-                            print(f"\n📄 JSON exported to {chat_id}")
-                        else:
+                        if not send_telegram_file(chat_id, STATE_FILE, caption):
                             send_telegram_to(chat_id, "❌ Gagal mengirim file")
                     else:
                         send_telegram_to(chat_id, "❌ State file tidak ditemukan")
@@ -443,8 +436,7 @@ def telegram_handler():
                         send_telegram_to(chat_id, "ℹ️ No state file.")
             
             time.sleep(1)
-        except Exception as e:
-            print(f"❌ Handler error: {e}")
+        except:
             time.sleep(3)
 
 def on_message(ws, message):
