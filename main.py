@@ -369,7 +369,12 @@ def telegram_handler():
                 if not text or not chat_id:
                     continue
                 
-                if text == '/start':
+                # Handle command dengan @botname (untuk grup)
+                command = text.split('@')[0].lower() if text.startswith('/') else ''
+                
+                print(f"📩 Received: {text} from {chat_id}")  # Debug log
+                
+                if command == '/start':
                     reply = "🤖 <b>Gate.io Maintenance Bot</b>\n\n"
                     reply += "📋 <b>Commands:</b>\n"
                     reply += "/withdraw - List withdraw maintenance\n"
@@ -379,15 +384,15 @@ def telegram_handler():
                     reply += "/status - Bot status\n"
                     send_telegram_to(chat_id, reply)
                 
-                elif text == '/withdraw':
+                elif command == '/withdraw':
                     coins = get_withdraw_list()
                     send_long_message(chat_id, "📤 <b>WITHDRAW MAINTENANCE</b>", coins)
                 
-                elif text == '/deposit':
+                elif command == '/deposit':
                     coins = get_deposit_list()
                     send_long_message(chat_id, "📥 <b>DEPOSIT MAINTENANCE</b>", coins)
                 
-                elif text == '/export':
+                elif command == '/export':
                     send_telegram_to(chat_id, "⏳ Generating file...")
                     filepath = generate_export_file()
                     wib = get_wib_time()
@@ -400,7 +405,7 @@ def telegram_handler():
                     else:
                         send_telegram_to(chat_id, "❌ Gagal mengirim file")
                 
-                elif text == '/export_json':
+                elif command == '/export_json':
                     save_state()
                     if os.path.exists(STATE_FILE):
                         wib = get_wib_time()
@@ -415,7 +420,7 @@ def telegram_handler():
                     else:
                         send_telegram_to(chat_id, "❌ State file tidak ditemukan")
                 
-                elif text == '/status':
+                elif command == '/status':
                     wib = get_wib_time()
                     status = "🟢 Connected" if ws_connected else "🔴 Disconnected"
                     w_count = sum(1 for v in previous_withdraw.values() if v)
@@ -430,7 +435,7 @@ def telegram_handler():
                     reply += f"📊 Total: {len(previous_withdraw)} chains"
                     send_telegram_to(chat_id, reply)
                 
-                elif text == '/reset':
+                elif command == '/reset':
                     if os.path.exists(STATE_FILE):
                         os.remove(STATE_FILE)
                         send_telegram_to(chat_id, "✅ State reset! Restart bot.")
@@ -438,7 +443,8 @@ def telegram_handler():
                         send_telegram_to(chat_id, "ℹ️ No state file.")
             
             time.sleep(1)
-        except:
+        except Exception as e:
+            print(f"❌ Handler error: {e}")
             time.sleep(3)
 
 def on_message(ws, message):
