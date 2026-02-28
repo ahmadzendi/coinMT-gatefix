@@ -377,7 +377,6 @@ def telegram_handler():
                     reply += "/export - Download maintenance.txt\n"
                     reply += "/export_json - Download state JSON\n"
                     reply += "/status - Bot status\n"
-                    reply += "/reset - Reset state"
                     send_telegram_to(chat_id, reply)
                 
                 elif text == '/withdraw':
