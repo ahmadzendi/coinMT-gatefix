@@ -6,66 +6,78 @@ import threading
 import urllib.request
 import os
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 STATE_FILE = 'maintenance_state.json'
 EXPORT_FILE = 'maintenance.txt'
 
-previous_withdraw = {}
-previous_deposit = {}
+previous_withdraw = {}  # Key: "CURRENCY_CHAIN" → Value: True/False
+previous_deposit = {}   # Key: "CURRENCY" → Value: True/False (tanpa chain!)
 withdraw_times = {}
 deposit_times = {}
 ws_connected = False
 reconnect_count = 0
 
+state_lock = threading.Lock()
+initial_data_loaded = False
+
+
 def get_wib_time():
     wib = timezone(timedelta(hours=7))
     return datetime.now(wib).strftime('%Y-%m-%d %H:%M:%S WIB')
+
 
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                print(f"✅ Loaded state: {len(data.get('withdraw', {}))} entries")
+                print(f"✅ Loaded state: {len(data.get('withdraw', {}))} withdraw, {len(data.get('deposit', {}))} deposit")
                 return data
         except Exception as e:
             print(f"⚠️ Error loading state: {e}")
     return None
 
+
 def save_state():
     try:
-        data = {
-            'withdraw': previous_withdraw,
-            'deposit': previous_deposit,
-            'withdraw_times': withdraw_times,
-            'deposit_times': deposit_times,
-            'last_update': get_wib_time()
-        }
-        with open(STATE_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2)
+        with state_lock:
+            data = {
+                'withdraw': previous_withdraw.copy(),
+                'deposit': previous_deposit.copy(),
+                'withdraw_times': withdraw_times.copy(),
+                'deposit_times': deposit_times.copy(),
+                'last_update': get_wib_time()
+            }
+            temp_file = STATE_FILE + '.tmp'
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+            os.replace(temp_file, STATE_FILE)
     except Exception as e:
         print(f"⚠️ Error saving state: {e}")
 
+
 def generate_export_file():
     wib = get_wib_time()
-    
+
     content = "=" * 60 + "\n"
     content += "📊 GATE.IO MAINTENANCE REPORT\n"
     content += f"📅 Generated: {wib}\n"
     content += "=" * 60 + "\n\n"
-    
-    content += "📤 WITHDRAW MAINTENANCE\n"
+
+    # WITHDRAW - per chain
+    content += "📤 WITHDRAW MAINTENANCE (per chain)\n"
     content += "-" * 60 + "\n"
-    
+
     withdraw_list = []
-    for key, disabled in previous_withdraw.items():
-        if disabled:
-            currency, chain = key.rsplit('_', 1)
-            coin_time = withdraw_times.get(key, "Unknown")
-            withdraw_list.append((currency, chain, coin_time))
-    
+    with state_lock:
+        for key, disabled in previous_withdraw.items():
+            if disabled:
+                currency, chain = key.rsplit('_', 1)
+                coin_time = withdraw_times.get(key, "Unknown")
+                withdraw_list.append((currency, chain, coin_time))
+
     if withdraw_list:
         withdraw_list.sort(key=lambda x: x[0])
         for i, (currency, chain, coin_time) in enumerate(withdraw_list, 1):
@@ -73,83 +85,97 @@ def generate_export_file():
             content += f"   Maintenance since: {coin_time}\n"
     else:
         content += "✅ Tidak ada coin dalam maintenance\n"
-    
+
     content += f"\nTotal: {len(withdraw_list)} chains\n"
     content += "\n" + "=" * 60 + "\n\n"
-    
-    content += "📥 DEPOSIT MAINTENANCE\n"
+
+    # DEPOSIT - per currency (tanpa chain)
+    content += "📥 DEPOSIT MAINTENANCE (per currency)\n"
     content += "-" * 60 + "\n"
-    
+
     deposit_list = []
-    for key, disabled in previous_deposit.items():
-        if disabled:
-            currency, chain = key.rsplit('_', 1)
-            coin_time = deposit_times.get(key, "Unknown")
-            deposit_list.append((currency, chain, coin_time))
-    
+    with state_lock:
+        for currency, disabled in previous_deposit.items():
+            if disabled:
+                coin_time = deposit_times.get(currency, "Unknown")
+                deposit_list.append((currency, coin_time))
+
     if deposit_list:
         deposit_list.sort(key=lambda x: x[0])
-        for i, (currency, chain, coin_time) in enumerate(deposit_list, 1):
-            content += f"{i}. {currency} - {chain}\n"
+        for i, (currency, coin_time) in enumerate(deposit_list, 1):
+            content += f"{i}. {currency}\n"
             content += f"   Maintenance since: {coin_time}\n"
     else:
         content += "✅ Tidak ada coin dalam maintenance\n"
-    
-    content += f"\nTotal: {len(deposit_list)} chains\n"
+
+    content += f"\nTotal: {len(deposit_list)} coins\n"
     content += "\n" + "=" * 60 + "\n"
     content += "🤖 Gate.io Maintenance Bot\n"
     content += "=" * 60 + "\n"
-    
+
     with open(EXPORT_FILE, 'w', encoding='utf-8') as f:
         f.write(content)
-    
+
     return EXPORT_FILE
 
+
 def send_telegram(message):
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = json.dumps({
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": "HTML"
-        }).encode('utf-8')
-        
-        req = urllib.request.Request(url, data=data)
-        req.add_header('Content-Type', 'application/json')
-        
-        with urllib.request.urlopen(req, timeout=10) as response:
-            return True
-    except Exception as e:
-        print(f"\n❌ Telegram error: {e}")
-        return False
+    for attempt in range(3):
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            data = json.dumps({
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+                "parse_mode": "HTML"
+            }).encode('utf-8')
+
+            req = urllib.request.Request(url, data=data)
+            req.add_header('Content-Type', 'application/json')
+
+            with urllib.request.urlopen(req, timeout=10) as response:
+                result = json.loads(response.read())
+                if result.get('ok'):
+                    return True
+                else:
+                    print(f"\n❌ Telegram API error: {result}")
+        except Exception as e:
+            print(f"\n❌ Telegram error (attempt {attempt+1}): {e}")
+            if attempt < 2:
+                time.sleep(2)
+    return False
+
 
 def send_telegram_to(chat_id, message):
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = json.dumps({
-            "chat_id": chat_id,
-            "text": message,
-            "parse_mode": "HTML"
-        }).encode('utf-8')
-        
-        req = urllib.request.Request(url, data=data)
-        req.add_header('Content-Type', 'application/json')
-        
-        with urllib.request.urlopen(req, timeout=10) as response:
-            return True
-    except:
-        return False
+    for attempt in range(3):
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            data = json.dumps({
+                "chat_id": chat_id,
+                "text": message,
+                "parse_mode": "HTML"
+            }).encode('utf-8')
+
+            req = urllib.request.Request(url, data=data)
+            req.add_header('Content-Type', 'application/json')
+
+            with urllib.request.urlopen(req, timeout=10) as response:
+                return True
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(2)
+    return False
+
 
 def send_telegram_file(chat_id, filepath, caption=""):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
         boundary = '----WebKitFormBoundary7MA4YWxkTrZu0gW'
-        
+
         with open(filepath, 'rb') as f:
             file_content = f.read()
-        
+
         filename = os.path.basename(filepath)
-        
+
         body = b''
         body += f'--{boundary}\r\n'.encode()
         body += f'Content-Disposition: form-data; name="chat_id"\r\n\r\n{chat_id}\r\n'.encode()
@@ -160,52 +186,54 @@ def send_telegram_file(chat_id, filepath, caption=""):
         body += f'\r\n--{boundary}\r\n'.encode()
         body += f'Content-Disposition: form-data; name="caption"\r\n\r\n{caption}\r\n'.encode()
         body += f'--{boundary}--\r\n'.encode()
-        
+
         req = urllib.request.Request(url, data=body)
         req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
-        
+
         with urllib.request.urlopen(req, timeout=30) as response:
             return True
     except Exception as e:
         print(f"\n❌ Send file error: {e}")
         return False
 
+
 def send_long_message(chat_id, header, coins_list):
     wib = get_wib_time()
-    
+
     if not coins_list:
         msg = f"{header}\n📅 {wib}\n\n✅ Tidak ada coin dalam maintenance"
         send_telegram_to(chat_id, msg)
         return
-    
+
     chunk_size = 50
     total_coins = len(coins_list)
     total_pages = (total_coins + chunk_size - 1) // chunk_size
-    
-    first_msg = f"{header}\n📅 {wib}\n📊 Total: {total_coins} chains\n\n"
-    
+
+    first_msg = f"{header}\n📅 {wib}\n📊 Total: {total_coins}\n\n"
+
     for i, (coin, coin_time) in enumerate(coins_list[:chunk_size], 1):
         first_msg += f"{i}. {coin} | {coin_time}\n"
-    
+
     send_telegram_to(chat_id, first_msg)
-    
+
     for page in range(1, total_pages):
         time.sleep(0.5)
         start = page * chunk_size
         end = min(start + chunk_size, total_coins)
-        
+
         msg = ""
         for i, (coin, coin_time) in enumerate(coins_list[start:end], start + 1):
             msg += f"{i}. {coin} | {coin_time}\n"
-        
+
         send_telegram_to(chat_id, msg)
+
 
 def get_telegram_updates(offset=None):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?timeout=1"
         if offset:
             url += f"&offset={offset}"
-        
+
         req = urllib.request.Request(url)
         with urllib.request.urlopen(req, timeout=5) as response:
             data = json.loads(response.read())
@@ -213,11 +241,12 @@ def get_telegram_updates(offset=None):
     except:
         return []
 
+
 def check_maintenance_rest():
     url = "https://api.gateio.ws/api/v4/spot/currencies"
     req = urllib.request.Request(url)
     req.add_header('User-Agent', 'Mozilla/5.0')
-    
+
     for attempt in range(5):
         try:
             print(f"\r📡 Fetching data... (attempt {attempt+1}/5)", end="", flush=True)
@@ -235,294 +264,390 @@ def check_maintenance_rest():
                 time.sleep(3)
     return None
 
+
 def process_maintenance_data(currencies, loaded_state):
+    """
+    ✅ FIXED: 
+    - Withdraw: per CHAIN (currency_chain)
+    - Deposit: per CURRENCY (langsung dari currency level)
+    """
     global previous_withdraw, previous_deposit, withdraw_times, deposit_times
-    
+
     wib_now = get_wib_time()
-    
+
     old_withdraw = loaded_state.get('withdraw', {}) if loaded_state else {}
     old_deposit = loaded_state.get('deposit', {}) if loaded_state else {}
     old_withdraw_times = loaded_state.get('withdraw_times', {}) if loaded_state else {}
     old_deposit_times = loaded_state.get('deposit_times', {}) if loaded_state else {}
-    
+
     print(f"\n🔴 CURRENT MAINTENANCE ({wib_now}):")
-    print("="*60)
-    
-    current_withdraw = {}
-    current_deposit = {}
-    
+    print("=" * 60)
+
+    current_withdraw = {}  # Key: CURRENCY_CHAIN
+    current_deposit = {}   # Key: CURRENCY (tanpa chain!)
+
     for coin in currencies:
         currency = coin.get('currency')
+        
+        # ✅ DEPOSIT: Ambil dari level currency langsung!
+        deposit_disabled = coin.get('deposit_disabled', False)
+        current_deposit[currency] = deposit_disabled
+        
+        # ✅ WITHDRAW: Ambil dari setiap chain
         for chain in coin.get('chains', []):
             chain_name = chain.get('name')
             key = f"{currency}_{chain_name}"
             current_withdraw[key] = chain.get('withdraw_disabled', False)
-            current_deposit[key] = chain.get('deposit_disabled', False)
-    
+
     changes = []
-    all_keys = set(current_withdraw.keys()) | set(old_withdraw.keys())
-    
-    for key in all_keys:
-        curr_w = current_withdraw.get(key, False)
-        prev_w = old_withdraw.get(key, None)
-        curr_d = current_deposit.get(key, False)
-        prev_d = old_deposit.get(key, None)
+
+    with state_lock:
+        # ====== PROSES WITHDRAW (per chain) ======
+        all_withdraw_keys = set(current_withdraw.keys()) | set(old_withdraw.keys())
         
-        currency, chain_name = key.rsplit('_', 1)
+        for key in all_withdraw_keys:
+            curr_w = current_withdraw.get(key, False)
+            prev_w = old_withdraw.get(key, None)
+
+            currency, chain_name = key.rsplit('_', 1)
+
+            if prev_w is not None:
+                if prev_w == False and curr_w == True:
+                    withdraw_times[key] = wib_now
+                    changes.append(('withdraw', 'masuk', currency, chain_name, key))
+                elif prev_w == True and curr_w == False:
+                    changes.append(('withdraw', 'keluar', currency, chain_name, key))
+                    if key in withdraw_times:
+                        del withdraw_times[key]
+                elif prev_w == True and curr_w == True:
+                    withdraw_times[key] = old_withdraw_times.get(key, wib_now)
+            else:
+                if curr_w == True:
+                    withdraw_times[key] = wib_now
+
+        # ====== PROSES DEPOSIT (per currency, tanpa chain) ======
+        all_deposit_keys = set(current_deposit.keys()) | set(old_deposit.keys())
         
-        if prev_w is not None:
-            if prev_w == False and curr_w == True:
-                withdraw_times[key] = wib_now
-                changes.append(('withdraw', 'masuk', currency, chain_name, key))
-            elif prev_w == True and curr_w == False:
-                changes.append(('withdraw', 'keluar', currency, chain_name, key))
-            elif prev_w == True and curr_w == True:
-                withdraw_times[key] = old_withdraw_times.get(key, wib_now)
-        else:
-            if curr_w == True:
-                withdraw_times[key] = wib_now
-        
-        if prev_d is not None:
-            if prev_d == False and curr_d == True:
-                deposit_times[key] = wib_now
-                changes.append(('deposit', 'masuk', currency, chain_name, key))
-            elif prev_d == True and curr_d == False:
-                changes.append(('deposit', 'keluar', currency, chain_name, key))
-            elif prev_d == True and curr_d == True:
-                deposit_times[key] = old_deposit_times.get(key, wib_now)
-        else:
-            if curr_d == True:
-                deposit_times[key] = wib_now
-    
-    previous_withdraw = current_withdraw
-    previous_deposit = current_deposit
-    
+        for currency in all_deposit_keys:
+            curr_d = current_deposit.get(currency, False)
+            prev_d = old_deposit.get(currency, None)
+
+            if prev_d is not None:
+                if prev_d == False and curr_d == True:
+                    deposit_times[currency] = wib_now
+                    changes.append(('deposit', 'masuk', currency, None, currency))
+                elif prev_d == True and curr_d == False:
+                    changes.append(('deposit', 'keluar', currency, None, currency))
+                    if currency in deposit_times:
+                        del deposit_times[currency]
+                elif prev_d == True and curr_d == True:
+                    deposit_times[currency] = old_deposit_times.get(currency, wib_now)
+            else:
+                if curr_d == True:
+                    deposit_times[currency] = wib_now
+
+        previous_withdraw = current_withdraw
+        previous_deposit = current_deposit
+
     withdraw_count = sum(1 for v in current_withdraw.values() if v)
     deposit_count = sum(1 for v in current_deposit.values() if v)
-    
+
     print(f"📤 Withdraw Disabled: {withdraw_count} chains")
-    print(f"📥 Deposit Disabled: {deposit_count} chains")
-    print(f"📊 Total Tracking: {len(current_withdraw)} chains")
-    print("="*60)
-    
+    print(f"📥 Deposit Disabled: {deposit_count} coins")
+    print(f"📊 Total Tracking: {len(current_withdraw)} chains, {len(current_deposit)} coins")
+    print("=" * 60)
+
+    # Kirim notifikasi perubahan
     if loaded_state and changes:
         print(f"\n📊 Detected {len(changes)} changes:")
-        
+
         for change_type, action, currency, chain_name, key in changes:
-            emoji = "🟢" if action == 'masuk' else "🔴"
-            
-            if action == 'keluar':
-                if change_type == 'withdraw' and key in withdraw_times:
-                    del withdraw_times[key]
-                if change_type == 'deposit' and key in deposit_times:
-                    del deposit_times[key]
-            
             type_text = "Withdraw" if change_type == 'withdraw' else "Deposit"
-            action_text = "Masuk" if action == 'masuk' else "Keluar"
-            
-            print(f"   {emoji} {currency} - {chain_name} ({type_text} {action_text})")
-            
-            tg_msg = f"{emoji} <b>{action_text} {type_text} Maintenance</b>\n\n"
-            tg_msg += f"💰 Coin  : <b>{currency} ({chain_name})</b>\n"
+
+            if action == 'masuk':
+                emoji = "🔴"
+                action_text = "Masuk Maintenance"
+            else:
+                emoji = "🟢"
+                action_text = "Keluar Maintenance"
+
+            # Format display berbeda untuk withdraw (ada chain) vs deposit (tanpa chain)
+            if change_type == 'withdraw':
+                display_name = f"{currency} ({chain_name})"
+            else:
+                display_name = currency
+
+            print(f"   {emoji} {display_name} ({type_text} {action_text})")
+
+            tg_msg = f"{emoji} <b>{type_text} {action_text}</b>\n\n"
+            tg_msg += f"💰 Coin  : <b>{display_name}</b>\n"
             tg_msg += f"📅 Time  : {wib_now}"
-            send_telegram(tg_msg)
+
+            result = send_telegram(tg_msg)
+            if result:
+                print(f"   ✅ Notifikasi terkirim: {display_name}")
+            else:
+                print(f"   ❌ GAGAL kirim notifikasi: {display_name}")
+
+            time.sleep(0.3)
+
     elif loaded_state:
         print(f"\n✅ No changes since last run")
     else:
         print(f"\n📝 First run - state saved")
-    
+
     save_state()
 
+
 def get_withdraw_list():
+    """List withdraw maintenance (per chain)"""
     coins = []
-    for key, disabled in previous_withdraw.items():
-        if disabled:
-            currency, chain = key.rsplit('_', 1)
-            coin_time = withdraw_times.get(key, "Unknown")
-            coins.append((f"{currency} - {chain}", coin_time))
+    with state_lock:
+        for key, disabled in previous_withdraw.items():
+            if disabled:
+                currency, chain = key.rsplit('_', 1)
+                coin_time = withdraw_times.get(key, "Unknown")
+                coins.append((f"{currency} - {chain}", coin_time))
     return coins
 
+
 def get_deposit_list():
+    """List deposit maintenance (per currency, tanpa chain)"""
     coins = []
-    for key, disabled in previous_deposit.items():
-        if disabled:
-            currency, chain = key.rsplit('_', 1)
-            coin_time = deposit_times.get(key, "Unknown")
-            coins.append((f"{currency} - {chain}", coin_time))
+    with state_lock:
+        for currency, disabled in previous_deposit.items():
+            if disabled:
+                coin_time = deposit_times.get(currency, "Unknown")
+                coins.append((currency, coin_time))
     return coins
+
 
 def telegram_handler():
     print("📱 Telegram handler started")
     last_update_id = None
-    
+
     while True:
         try:
             updates = get_telegram_updates(last_update_id)
-            
+
             for update in updates:
                 last_update_id = update['update_id'] + 1
-                
+
                 message = update.get('message', {})
                 text = message.get('text', '')
                 chat_id = message.get('chat', {}).get('id')
-                
+
                 if not text or not chat_id:
                     continue
-                
+
                 command = text.split('@')[0].lower() if text.startswith('/') else ''
-                
+
                 if command == '/start':
                     reply = "🤖 <b>Gate.io Maintenance Bot</b>\n\n"
                     reply += "📋 <b>Commands:</b>\n"
-                    reply += "/withdraw - List withdraw maintenance\n"
-                    reply += "/deposit - List deposit maintenance\n"
+                    reply += "/withdraw - List withdraw maintenance (per chain)\n"
+                    reply += "/deposit - List deposit maintenance (per coin)\n"
+                    reply += "/check - Force re-check dari REST API\n"
                     reply += "/export - Download maintenance.txt\n"
                     reply += "/export_json - Download state JSON\n"
                     reply += "/status - Bot status\n"
                     send_telegram_to(chat_id, reply)
-                
+
                 elif command == '/withdraw':
                     coins = get_withdraw_list()
-                    send_long_message(chat_id, "📤 <b>WITHDRAW MAINTENANCE</b>", coins)
-                
+                    send_long_message(chat_id, "📤 <b>WITHDRAW MAINTENANCE</b>\n(per chain)", coins)
+
                 elif command == '/deposit':
                     coins = get_deposit_list()
-                    send_long_message(chat_id, "📥 <b>DEPOSIT MAINTENANCE</b>", coins)
-                
+                    send_long_message(chat_id, "📥 <b>DEPOSIT MAINTENANCE</b>\n(per currency)", coins)
+
+                elif command == '/check':
+                    send_telegram_to(chat_id, "⏳ Force checking REST API...")
+                    currencies = check_maintenance_rest()
+                    if currencies and currencies != "exit":
+                        loaded_state = load_state()
+                        process_maintenance_data(currencies, loaded_state)
+                        w = sum(1 for v in previous_withdraw.values() if v)
+                        d = sum(1 for v in previous_deposit.values() if v)
+                        send_telegram_to(
+                            chat_id,
+                            f"✅ Re-check selesai\n📤 Withdraw: {w} chains\n📥 Deposit: {d} coins"
+                        )
+                    else:
+                        send_telegram_to(chat_id, "❌ Gagal fetch data")
+
                 elif command == '/export':
                     send_telegram_to(chat_id, "⏳ Generating file...")
                     filepath = generate_export_file()
                     wib = get_wib_time()
                     w = sum(1 for v in previous_withdraw.values() if v)
                     d = sum(1 for v in previous_deposit.values() if v)
-                    caption = f"📊 Maintenance Report\n📅 {wib}\n📤 Withdraw: {w} | 📥 Deposit: {d}"
-                    
+                    caption = (
+                        f"📊 Maintenance Report\n"
+                        f"📅 {wib}\n"
+                        f"📤 Withdraw: {w} chains\n"
+                        f"📥 Deposit: {d} coins"
+                    )
                     if not send_telegram_file(chat_id, filepath, caption):
                         send_telegram_to(chat_id, "❌ Gagal mengirim file")
-                
+
                 elif command == '/export_json':
                     save_state()
                     if os.path.exists(STATE_FILE):
                         wib = get_wib_time()
                         w = sum(1 for v in previous_withdraw.values() if v)
                         d = sum(1 for v in previous_deposit.values() if v)
-                        caption = f"📊 State JSON\n📅 {wib}\n📤 Withdraw: {w} | 📥 Deposit: {d}"
-                        
+                        caption = (
+                            f"📊 State JSON\n"
+                            f"📅 {wib}\n"
+                            f"📤 Withdraw: {w} chains\n"
+                            f"📥 Deposit: {d} coins"
+                        )
                         if not send_telegram_file(chat_id, STATE_FILE, caption):
                             send_telegram_to(chat_id, "❌ Gagal mengirim file")
                     else:
                         send_telegram_to(chat_id, "❌ State file tidak ditemukan")
-                
+
                 elif command == '/status':
                     wib = get_wib_time()
                     status = "🟢 Connected" if ws_connected else "🔴 Disconnected"
                     w_count = sum(1 for v in previous_withdraw.values() if v)
                     d_count = sum(1 for v in previous_deposit.values() if v)
-                    
+
                     reply = f"📊 <b>BOT STATUS</b>\n\n"
                     reply += f"📅 Time: {wib}\n"
                     reply += f"🔌 WebSocket: {status}\n"
                     reply += f"🔄 Reconnects: {reconnect_count}\n"
-                    reply += f"📤 Withdraw: {w_count}\n"
-                    reply += f"📥 Deposit: {d_count}\n"
-                    reply += f"📊 Total: {len(previous_withdraw)} chains"
+                    reply += f"📤 Withdraw: {w_count} chains\n"
+                    reply += f"📥 Deposit: {d_count} coins\n"
+                    reply += f"📊 Total: {len(previous_withdraw)} chains, {len(previous_deposit)} coins\n"
+                    reply += f"🔒 Data loaded: {initial_data_loaded}"
                     send_telegram_to(chat_id, reply)
-                
+
                 elif command == '/reset':
                     if os.path.exists(STATE_FILE):
                         os.remove(STATE_FILE)
                         send_telegram_to(chat_id, "✅ State reset! Restart bot.")
                     else:
                         send_telegram_to(chat_id, "ℹ️ No state file.")
-            
+
             time.sleep(1)
-        except:
+        except Exception as e:
+            print(f"\n❌ Telegram handler error: {e}")
             time.sleep(3)
 
+
 def on_message(ws, message):
+    """
+    ✅ FIXED WebSocket handler:
+    - Withdraw: dari chains[].withdraw_disabled
+    - Deposit: dari currency level deposit_disabled
+    """
     global previous_withdraw, previous_deposit
-    
+
+    if not initial_data_loaded:
+        return
+
     try:
         data = json.loads(message)
-        
+
         if data.get('event') == 'update' and data.get('channel') == 'spot.currency_status':
             result = data.get('result', {})
             currency = result.get('currency', '')
-            chains = result.get('chains', [])
             
+            if not currency:
+                return
+
             state_changed = False
-            
-            for chain in chains:
-                chain_name = chain.get('name', '')
-                withdraw_disabled = chain.get('withdraw_disabled', False)
-                deposit_disabled = chain.get('deposit_disabled', False)
-                key = f"{currency}_{chain_name}"
-                
-                prev_withdraw = previous_withdraw.get(key, None)
-                prev_deposit = previous_deposit.get(key, None)
-                wib = get_wib_time()
-                
-                if prev_withdraw == False and withdraw_disabled == True:
+            wib = get_wib_time()
+
+            with state_lock:
+                # ====== DEPOSIT: dari currency level ======
+                deposit_disabled = result.get('deposit_disabled', False)
+                prev_deposit_val = previous_deposit.get(currency, None)
+
+                if prev_deposit_val is not None and prev_deposit_val != deposit_disabled:
                     state_changed = True
-                    withdraw_times[key] = wib
-                    print(f"\n🟢 Masuk Withdraw Maintenance: {currency} ({chain_name})")
-                    
-                    tg_msg = f"🟢 <b>Masuk Withdraw Maintenance</b>\n\n"
-                    tg_msg += f"💰 Coin  : <b>{currency} ({chain_name})</b>\n"
+
+                    if deposit_disabled:
+                        deposit_times[currency] = wib
+                        emoji = "🔴"
+                        action = "Masuk Deposit Maintenance"
+                        print(f"\n{emoji} {action}: {currency}")
+                    else:
+                        if currency in deposit_times:
+                            del deposit_times[currency]
+                        emoji = "🟢"
+                        action = "Keluar Deposit Maintenance"
+                        print(f"\n{emoji} {action}: {currency}")
+
+                    tg_msg = f"{emoji} <b>{action}</b>\n\n"
+                    tg_msg += f"💰 Coin  : <b>{currency}</b>\n"
                     tg_msg += f"📅 Time  : {wib}"
-                    send_telegram(tg_msg)
-                
-                elif prev_withdraw == True and withdraw_disabled == False:
+
+                    threading.Thread(
+                        target=send_telegram,
+                        args=(tg_msg,),
+                        daemon=True
+                    ).start()
+
+                elif prev_deposit_val is None and deposit_disabled:
                     state_changed = True
-                    if key in withdraw_times:
-                        del withdraw_times[key]
-                    print(f"\n🔴 Keluar Withdraw Maintenance: {currency} ({chain_name})")
-                    
-                    tg_msg = f"🔴 <b>Keluar Withdraw Maintenance</b>\n\n"
-                    tg_msg += f"💰 Coin  : <b>{currency} ({chain_name})</b>\n"
-                    tg_msg += f"📅 Time  : {wib}"
-                    send_telegram(tg_msg)
+                    deposit_times[currency] = wib
+
+                previous_deposit[currency] = deposit_disabled
+
+                # ====== WITHDRAW: dari chains ======
+                chains = result.get('chains', [])
                 
-                elif prev_withdraw is None and withdraw_disabled == True:
-                    state_changed = True
-                    withdraw_times[key] = wib
-                
-                if prev_deposit == False and deposit_disabled == True:
-                    state_changed = True
-                    deposit_times[key] = wib
-                    print(f"\n🟢 Masuk Deposit Maintenance: {currency} ({chain_name})")
-                    
-                    tg_msg = f"🟢 <b>Masuk Deposit Maintenance</b>\n\n"
-                    tg_msg += f"💰 Coin  : <b>{currency} ({chain_name})</b>\n"
-                    tg_msg += f"📅 Time  : {wib}"
-                    send_telegram(tg_msg)
-                
-                elif prev_deposit == True and deposit_disabled == False:
-                    state_changed = True
-                    if key in deposit_times:
-                        del deposit_times[key]
-                    print(f"\n🔴 Keluar Deposit Maintenance: {currency} ({chain_name})")
-                    
-                    tg_msg = f"🔴 <b>Keluar Deposit Maintenance</b>\n\n"
-                    tg_msg += f"💰 Coin  : <b>{currency} ({chain_name})</b>\n"
-                    tg_msg += f"📅 Time  : {wib}"
-                    send_telegram(tg_msg)
-                
-                elif prev_deposit is None and deposit_disabled == True:
-                    state_changed = True
-                    deposit_times[key] = wib
-                
-                previous_withdraw[key] = withdraw_disabled
-                previous_deposit[key] = deposit_disabled
-            
+                for chain in chains:
+                    chain_name = chain.get('name', '')
+                    withdraw_disabled = chain.get('withdraw_disabled', False)
+                    key = f"{currency}_{chain_name}"
+
+                    prev_withdraw_val = previous_withdraw.get(key, None)
+
+                    if prev_withdraw_val is not None and prev_withdraw_val != withdraw_disabled:
+                        state_changed = True
+
+                        if withdraw_disabled:
+                            withdraw_times[key] = wib
+                            emoji = "🔴"
+                            action = "Masuk Withdraw Maintenance"
+                            print(f"\n{emoji} {action}: {currency} ({chain_name})")
+                        else:
+                            if key in withdraw_times:
+                                del withdraw_times[key]
+                            emoji = "🟢"
+                            action = "Keluar Withdraw Maintenance"
+                            print(f"\n{emoji} {action}: {currency} ({chain_name})")
+
+                        tg_msg = f"{emoji} <b>{action}</b>\n\n"
+                        tg_msg += f"💰 Coin  : <b>{currency} ({chain_name})</b>\n"
+                        tg_msg += f"📅 Time  : {wib}"
+
+                        threading.Thread(
+                            target=send_telegram,
+                            args=(tg_msg,),
+                            daemon=True
+                        ).start()
+
+                    elif prev_withdraw_val is None and withdraw_disabled:
+                        state_changed = True
+                        withdraw_times[key] = wib
+
+                    previous_withdraw[key] = withdraw_disabled
+
             if state_changed:
                 save_state()
-    
+
     except Exception as e:
         print(f"\n❌ Parse error: {e}")
 
+
 def on_error(ws, error):
     print(f"\n❌ WebSocket error: {error}")
+
 
 def on_close(ws, close_status_code, close_msg):
     global ws_connected, reconnect_count
@@ -530,11 +655,12 @@ def on_close(ws, close_status_code, close_msg):
     reconnect_count += 1
     print(f"\n⚠️ Disconnected (#{reconnect_count})")
 
+
 def on_open(ws):
-    global ws_connected, reconnect_count
+    global ws_connected
     ws_connected = True
     print(f"✅ WebSocket {'reconnected' if reconnect_count > 0 else 'connected'}!")
-    
+
     subscribe_message = {
         "time": int(time.time()),
         "channel": "spot.currency_status",
@@ -542,6 +668,23 @@ def on_open(ws):
     }
     ws.send(json.dumps(subscribe_message))
     print("📡 Subscribed to currency status")
+
+    if reconnect_count > 0:
+        print("🔄 Post-reconnect REST check...")
+        threading.Thread(target=post_reconnect_check, daemon=True).start()
+
+
+def post_reconnect_check():
+    time.sleep(3)
+    try:
+        currencies = check_maintenance_rest()
+        if currencies and currencies != "exit":
+            loaded_state = load_state()
+            process_maintenance_data(currencies, loaded_state)
+            print("✅ Post-reconnect check complete")
+    except Exception as e:
+        print(f"❌ Post-reconnect check error: {e}")
+
 
 def start_websocket():
     while True:
@@ -557,9 +700,10 @@ def start_websocket():
             ws.run_forever(ping_interval=20, ping_timeout=10)
         except Exception as e:
             print(f"\n❌ Exception: {e}")
-        
+
         print("🔄 Reconnecting in 5s...")
         time.sleep(5)
+
 
 def periodic_check():
     check_count = 0
@@ -567,39 +711,60 @@ def periodic_check():
         try:
             time.sleep(30)
             check_count += 1
-            
+
             wib = get_wib_time()
             status = "🟢" if ws_connected else "🔴"
-            w = sum(1 for v in previous_withdraw.values() if v)
-            d = sum(1 for v in previous_deposit.values() if v)
+            with state_lock:
+                w = sum(1 for v in previous_withdraw.values() if v)
+                d = sum(1 for v in previous_deposit.values() if v)
             print(f"\r🔄 {wib} | {status} | W:{w} D:{d}", end="", flush=True)
-            
+
+            # Save state setiap 5 menit
             if check_count % 10 == 0:
                 save_state()
+
+            # REST API re-check setiap 5 menit
+            if check_count % 10 == 0:
+                print(f"\n🔄 Periodic REST check #{check_count // 10}...")
+                try:
+                    currencies = check_maintenance_rest()
+                    if currencies and currencies != "exit":
+                        loaded_state = load_state()
+                        process_maintenance_data(currencies, loaded_state)
+                except Exception as e:
+                    print(f"❌ Periodic check error: {e}")
         except:
             break
 
+
 def main():
-    global previous_withdraw, previous_deposit, withdraw_times, deposit_times
-    
+    global previous_withdraw, previous_deposit
+    global withdraw_times, deposit_times, initial_data_loaded
+
     wib_now = get_wib_time()
-    
+
     print("🤖 Gate.io Maintenance Monitor")
     print(f"📅 Started: {wib_now}")
-    print("="*60)
-    
+    print("=" * 60)
+
+    if TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        print("⚠️ WARNING: TELEGRAM_BOT_TOKEN not set!")
+
+    if TELEGRAM_CHAT_ID == "YOUR_CHAT_ID_HERE":
+        print("⚠️ WARNING: TELEGRAM_CHAT_ID not set!")
+
     loaded_state = load_state()
-    
+
     if loaded_state:
         withdraw_times = loaded_state.get('withdraw_times', {})
         deposit_times = loaded_state.get('deposit_times', {})
         print(f"📂 Last update: {loaded_state.get('last_update', 'Unknown')}")
-    
+
     currencies = check_maintenance_rest()
-    
+
     if currencies == "exit":
         return
-    
+
     while not currencies:
         print("❌ Failed. Retrying...")
         try:
@@ -609,28 +774,35 @@ def main():
                 return
         except KeyboardInterrupt:
             return
-    
+
     process_maintenance_data(currencies, loaded_state)
-    
+
+    initial_data_loaded = True
+
     print("\n👀 Starting WebSocket...")
-    print("="*60)
-    
+    print("=" * 60)
+
     threading.Thread(target=telegram_handler, daemon=True).start()
     threading.Thread(target=start_websocket, daemon=True).start()
     threading.Thread(target=periodic_check, daemon=True).start()
-    
+
     w = sum(1 for v in previous_withdraw.values() if v)
     d = sum(1 for v in previous_deposit.values() if v)
-    
+
     startup_msg = f"🤖 <b>Bot Started</b>\n\n"
     startup_msg += f"📅 {wib_now}\n"
-    startup_msg += f"📤 Withdraw: {w}\n"
-    startup_msg += f"📥 Deposit: {d}\n"
-    startup_msg += f"📊 Total: {len(previous_withdraw)}"
+    startup_msg += f"📤 Withdraw: {w} chains\n"
+    startup_msg += f"📥 Deposit: {d} coins\n"
+    startup_msg += f"📊 Total: {len(previous_withdraw)} chains, {len(previous_deposit)} coins"
     if loaded_state:
         startup_msg += f"\n📂 <i>State restored</i>"
-    send_telegram(startup_msg)
-    
+
+    result = send_telegram(startup_msg)
+    if result:
+        print("✅ Startup notification sent")
+    else:
+        print("❌ Failed to send startup notification")
+
     try:
         while True:
             time.sleep(1)
@@ -639,6 +811,7 @@ def main():
         print(f"\n\n👋 Stopped at {wib}")
         save_state()
         send_telegram(f"🛑 <b>Bot Stopped</b>\n\n📅 {wib}")
+
 
 if __name__ == "__main__":
     main()
